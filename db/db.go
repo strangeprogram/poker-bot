@@ -30,7 +30,7 @@ func createTables() error {
 	return err
 }
 
-func GetPlayer(nick string) (*models.Player, error) {
+func GetOrCreatePlayer(nick string) (*models.Player, error) {
 	var money int
 	var handsWon int
 	err := db.QueryRow("SELECT money, hands_won FROM players WHERE nick = ?", nick).Scan(&money, &handsWon)
@@ -51,11 +51,6 @@ func GetPlayer(nick string) (*models.Player, error) {
 
 func UpdatePlayer(player *models.Player) error {
 	_, err := db.Exec("UPDATE players SET money = ?, hands_won = ? WHERE nick = ?", player.Money, player.HandsWon, player.Nick)
-	return err
-}
-
-func IncrementHandsWon(nick string) error {
-	_, err := db.Exec("UPDATE players SET hands_won = hands_won + 1 WHERE nick = ?", nick)
 	return err
 }
 

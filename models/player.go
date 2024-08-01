@@ -19,6 +19,9 @@ func NewPlayer(nick string, money int, handsWon int) *Player {
 		Money:    money,
 		HandsWon: handsWon,
 		Hand:     make([]Card, 0),
+		Bet:      0,
+		Folded:   false,
+		Cheating: false,
 		LastSeen: time.Now(),
 	}
 }

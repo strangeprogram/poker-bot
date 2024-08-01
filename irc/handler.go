@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"log"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,28 +19,29 @@ import (
 )
 
 type Handler struct {
-	conn            *irc.Connection
-	games           map[string]game.Game
-	whoisCache      map[string]bool
-	whoisCacheMutex sync.RWMutex
-	whoisRequests   map[string]chan bool
-	whoisMutex      sync.Mutex
+	conn         *irc.Connection
+	games        map[string]game.Game
+	lastCommand  map[string]time.Time
+	commandMutex sync.Mutex
+	server       string
+	nick         string
 }
 
 func NewHandler() *Handler {
 	return &Handler{
-		games:         make(map[string]game.Game),
-		whoisCache:    make(map[string]bool),
-		whoisRequests: make(map[string]chan bool),
+		games:       make(map[string]game.Game),
+		lastCommand: make(map[string]time.Time),
 	}
 }
 
 func (h *Handler) Connect(server, nick string) error {
+	h.server = server
+	h.nick = nick
 	h.conn = irc.IRC(nick, nick)
 	h.conn.VerboseCallbackHandler = true
 	h.conn.Debug = true
 	h.conn.UseTLS = true
-	h.conn.TLSConfig = &tls.Config{InsecureSkipVerify: true} // Note: In production, you should use proper certificate validation
+	h.conn.TLSConfig = &tls.Config{InsecureSkipVerify: true}
 
 	h.conn.AddCallback("001", func(e *irc.Event) {
 		log.Println("Connected to server, waiting before joining #poker")
@@ -53,8 +55,6 @@ func (h *Handler) Connect(server, nick string) error {
 	})
 	h.conn.AddCallback("PRIVMSG", h.handleMessage)
 	h.conn.AddCallback("JOIN", h.handleRejoin)
-	h.conn.AddCallback("330", h.handleIdentifiedNickReply) // RPL_WHOISACCOUNT
-	h.conn.AddCallback("318", h.handleEndOfWhois)          // RPL_ENDOFWHOIS
 
 	err := h.conn.Connect(server)
 	if err != nil {
@@ -66,10 +66,28 @@ func (h *Handler) Connect(server, nick string) error {
 }
 
 func (h *Handler) Run() {
-	h.conn.Loop()
+	for {
+		h.conn.Loop()
+		log.Println("IRC connection loop ended. Attempting to reconnect in 5 seconds...")
+		time.Sleep(5 * time.Second)
+		err := h.Connect(h.server, h.nick)
+		if err != nil {
+			log.Printf("Failed to reconnect: %v", err)
+		}
+	}
 }
 
 func (h *Handler) handleMessage(event *irc.Event) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Recovered from panic in handleMessage: %v", r)
+		}
+	}()
+
+	if !h.rateLimitCheck(event.Nick) {
+		return
+	}
+
 	message := strings.TrimSpace(event.Message())
 	parts := strings.Split(message, " ")
 	if len(parts) == 0 {
@@ -93,6 +111,8 @@ func (h *Handler) handleMessage(event *irc.Event) {
 		h.handleFold(event)
 	case "$check":
 		h.handleCheck(event)
+	case "$draw":
+		h.handleDraw(event)
 	case "$cheat":
 		h.handleCheat(event)
 	case "$score":
@@ -100,74 +120,30 @@ func (h *Handler) handleMessage(event *irc.Event) {
 	}
 }
 
-func (h *Handler) isRegisteredNick(nick string) bool {
-	h.whoisCacheMutex.RLock()
-	if registered, exists := h.whoisCache[nick]; exists {
-		h.whoisCacheMutex.RUnlock()
-		return registered
-	}
-	h.whoisCacheMutex.RUnlock()
+func (h *Handler) rateLimitCheck(nick string) bool {
+	h.commandMutex.Lock()
+	defer h.commandMutex.Unlock()
 
-	h.whoisMutex.Lock()
-	resultChan, exists := h.whoisRequests[nick]
-	if !exists {
-		resultChan = make(chan bool, 1)
-		h.whoisRequests[nick] = resultChan
-		h.whoisMutex.Unlock()
-		h.conn.SendRawf("WHOIS %s", nick)
-	} else {
-		h.whoisMutex.Unlock()
+	lastTime, exists := h.lastCommand[nick]
+	if !exists || time.Since(lastTime) >= 3*time.Second {
+		h.lastCommand[nick] = time.Now()
+		return true
 	}
-
-	select {
-	case result := <-resultChan:
-		return result
-	case <-time.After(15 * time.Second):
-		log.Printf("WHOIS timeout for nick: %s", nick)
-		h.whoisMutex.Lock()
-		delete(h.whoisRequests, nick)
-		h.whoisMutex.Unlock()
-		return false
-	}
+	return false
 }
 
-func (h *Handler) handleIdentifiedNickReply(e *irc.Event) {
-	if len(e.Arguments) >= 3 {
-		nick := e.Arguments[1]
-		if strings.Contains(strings.ToLower(e.Arguments[2]), "is logged in as") {
-			h.whoisCacheMutex.Lock()
-			h.whoisCache[nick] = true
-			h.whoisCacheMutex.Unlock()
-			log.Printf("Nick %s is identified", nick)
-			h.sendWhoisResult(nick, true)
-		}
-	}
-}
-
-func (h *Handler) handleEndOfWhois(e *irc.Event) {
-	if len(e.Arguments) >= 2 {
-		nick := e.Arguments[1]
-		h.whoisCacheMutex.RLock()
-		registered := h.whoisCache[nick]
-		h.whoisCacheMutex.RUnlock()
-		h.sendWhoisResult(nick, registered)
-		log.Printf("End of WHOIS for %s, registered: %v", nick, registered)
-	}
-}
-
-func (h *Handler) sendWhoisResult(nick string, result bool) {
-	h.whoisMutex.Lock()
-	if resultChan, exists := h.whoisRequests[nick]; exists {
-		select {
-		case resultChan <- result:
-		default:
-		}
-		delete(h.whoisRequests, nick)
-	}
-	h.whoisMutex.Unlock()
+func (h *Handler) isGameReadyForPlayers(game game.Game) bool {
+	return game != nil && !game.IsInProgress() && len(game.GetPlayers()) < 6 // Assumin max 6 players per game
 }
 
 func (h *Handler) handleStartGame(event *irc.Event) {
+	channel := event.Arguments[0]
+
+	if h.games[channel] != nil {
+		h.conn.Privmsg(channel, "A game is already in progress. Please wait for it to finish before starting a new one.")
+		return
+	}
+
 	message := strings.TrimSpace(event.Message())
 	parts := strings.Split(message, " ")
 
@@ -179,14 +155,8 @@ func (h *Handler) handleStartGame(event *irc.Event) {
 	}
 
 	gameType := strings.ToLower(parts[1])
-	channel := event.Arguments[0]
 
 	log.Printf("Attempting to start game of type: %s in channel: %s", gameType, channel)
-
-	if h.games[channel] != nil {
-		h.conn.Privmsg(channel, "A game is already in progress.")
-		return
-	}
 
 	var game game.Game
 	switch gameType {
@@ -210,18 +180,18 @@ func (h *Handler) handleJoinGame(event *irc.Event) {
 	game := h.games[channel]
 
 	if game == nil {
-		h.conn.Privmsg(channel, "No game in progress. Start one with $start <game_type>")
+		h.conn.Privmsg(channel, "No game in progress. Start one with $start <game_type>. Be sure to check your server buffer for notices from the bot.")
 		return
 	}
 
-	if !h.isRegisteredNick(event.Nick) {
-		h.conn.Privmsg(channel, fmt.Sprintf("%s, you need to register and identify your nick to play. If you've just identified, please try again.", event.Nick))
+	if !h.isGameReadyForPlayers(game) {
+		h.conn.Privmsg(channel, "Cannot join the game at this time. Either the game is in progress or the maximum number of players has been reached.")
 		return
 	}
 
-	player, err := db.GetPlayer(event.Nick)
+	player, err := db.GetOrCreatePlayer(event.Nick)
 	if err != nil {
-		log.Printf("Error getting player %s: %v", event.Nick, err)
+		log.Printf("Error getting or creating player %s: %v", event.Nick, err)
 		h.conn.Privmsg(channel, fmt.Sprintf("Error adding player %s to the game.", event.Nick))
 		return
 	}
@@ -336,6 +306,13 @@ func (h *Handler) handleRaise(event *irc.Event) {
 }
 
 func (h *Handler) handleFold(event *irc.Event) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Recovered from panic in handleFold: %v", r)
+			debug.PrintStack() // This will print the stack trace
+		}
+	}()
+
 	channel := event.Arguments[0]
 	game := h.games[channel]
 
@@ -350,8 +327,13 @@ func (h *Handler) handleFold(event *irc.Event) {
 		return
 	}
 
+	log.Printf("Player %s is folding", player.Nick)
+	log.Printf("Game state before fold: %+v", game)
+
 	game.Fold(player)
 	h.conn.Privmsg(channel, fmt.Sprintf("%s folds", event.Nick))
+
+	log.Printf("Game state after fold: %+v", game)
 
 	if h.checkRoundEnd(channel) {
 		return
@@ -387,8 +369,47 @@ func (h *Handler) handleCheck(event *irc.Event) {
 	h.announceNextTurn(channel)
 }
 
+func (h *Handler) handleDraw(event *irc.Event) {
+	channel := event.Arguments[0]
+	game := h.games[channel]
+
+	if game == nil {
+		h.conn.Privmsg(channel, "No game in progress.")
+		return
+	}
+
+	fiveCardDraw, ok := game.(*modes.FiveCardDraw)
+	if !ok {
+		h.conn.Privmsg(channel, "This command is only available in Five Card Draw.")
+		return
+	}
+
+	player := game.FindPlayer(event.Nick)
+	if player == nil {
+		h.conn.Privmsg(channel, fmt.Sprintf("%s, you're not in the game.", event.Nick))
+		return
+	}
+
+	if len(event.Arguments) < 2 {
+		h.conn.Privmsg(channel, "Usage: $draw <card indices to discard>")
+		return
+	}
+
+	indices := []int{}
+	for _, arg := range event.Arguments[1:] {
+		index, err := strconv.Atoi(arg)
+		if err != nil {
+			h.conn.Privmsg(channel, fmt.Sprintf("Invalid index: %s", arg))
+			return
+		}
+		indices = append(indices, index-1)
+	}
+
+	fiveCardDraw.DrawCards(player, indices)
+	h.conn.Notice(event.Nick, fmt.Sprintf("Your new hand: %v", player.Hand))
+}
+
 func (h *Handler) handleCheat(event *irc.Event) {
-	// Implement cheat logic here
 	h.conn.Privmsg(event.Arguments[0], "Cheating is not implemented yet.")
 }
 
@@ -420,6 +441,7 @@ func (h *Handler) handleRejoin(event *irc.Event) {
 
 func (h *Handler) startRound(channel string) {
 	game := h.games[channel]
+	game.SetInProgress(true)
 	game.ResetRound()
 	game.DealCards()
 
@@ -433,33 +455,40 @@ func (h *Handler) startRound(channel string) {
 
 func (h *Handler) announceNextTurn(channel string) {
 	game := h.games[channel]
-	currentPlayer := game.GetPlayers()[game.GetTurn()]
+	players := game.GetPlayers()
+	currentTurn := game.GetTurn()
+
+	log.Printf("Announcing next turn. Players: %d, Current turn: %d", len(players), currentTurn)
+
+	if currentTurn < 0 || currentTurn >= len(players) {
+		log.Printf("Error: Invalid turn index. Players: %d, Current turn: %d", len(players), currentTurn)
+		return
+	}
+
+	currentPlayer := players[currentTurn]
 	log.Printf("Announcing next turn: %s", currentPlayer.Nick)
-	h.conn.Privmsg(channel, fmt.Sprintf("It's %s's turn. Current bet: %d", currentPlayer.Nick, game.GetCurrentBet()))
+
+	availableCommands := "$bet, $call, $raise, $fold, $check"
+	if _, ok := game.(*modes.FiveCardDraw); ok {
+		availableCommands += ", $draw"
+	}
+
+	h.conn.Privmsg(channel, fmt.Sprintf("It's %s's turn. Current bet: %d. Don't forget to peep that server buffer for notices from me.", currentPlayer.Nick, game.GetCurrentBet()))
+	h.conn.Notice(currentPlayer.Nick, fmt.Sprintf("It's your turn. Available commands: %s", availableCommands))
 }
 
 func (h *Handler) checkRoundEnd(channel string) bool {
 	game := h.games[channel]
-	activePlayers := 0
-	var lastActivePlayer *models.Player
-
-	for _, player := range game.GetPlayers() {
-		if !player.Folded {
-			activePlayers++
-			lastActivePlayer = player
-		}
-	}
-
-	if activePlayers == 1 {
-		h.endRound(channel, lastActivePlayer)
+	if game.IsRoundOver() {
+		h.endRound(channel)
 		return true
 	}
-
 	return false
 }
 
-func (h *Handler) endRound(channel string, winner *models.Player) {
+func (h *Handler) endRound(channel string) {
 	game := h.games[channel]
+	winner := game.EvaluateHands()
 	winner.Money += game.GetPot()
 	winner.HandsWon++
 

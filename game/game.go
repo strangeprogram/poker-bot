@@ -2,9 +2,7 @@ package game
 
 import (
 	"errors"
-	"math/rand"
 	"poker-bot/models"
-	"time"
 )
 
 type Game interface {
@@ -28,6 +26,8 @@ type Game interface {
 	GetCurrentBet() int
 	GetTurn() int
 	IsInProgress() bool
+	SetInProgress(bool)
+	IsRoundOver() bool
 	GetChannel() string
 	ResetRound()
 }
@@ -142,6 +142,10 @@ func (g *BaseGame) IsInProgress() bool {
 	return g.InProgress
 }
 
+func (g *BaseGame) SetInProgress(inProgress bool) {
+	g.InProgress = inProgress
+}
+
 func (g *BaseGame) GetChannel() string {
 	return g.Channel
 }
@@ -168,9 +172,6 @@ func GenerateDeck() []models.Card {
 			deck = append(deck, models.Card{Suit: suit, Value: value})
 		}
 	}
-
-	rand.Seed(time.Now().UnixNano())
-	rand.Shuffle(len(deck), func(i, j int) { deck[i], deck[j] = deck[j], deck[i] })
 
 	return deck
 }
