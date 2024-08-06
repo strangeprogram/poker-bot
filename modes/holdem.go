@@ -3,6 +3,7 @@ package modes
 import (
 	"errors"
 	"fmt"
+	"log"
 	"poker-bot/game"
 	"poker-bot/models"
 	"sort"
@@ -90,11 +91,19 @@ func (h *Holdem) EvaluateHands() *models.Player {
 		if player.Folded {
 			continue
 		}
+		if len(player.Hand) == 0 {
+			log.Printf("Warning: Player %s has no cards", player.Nick)
+			continue
+		}
 		playerHand := evaluateHoldemHand(player.Hand, h.River)
 		if winner == nil || playerHand.beats(bestHand) {
 			winner = player
 			bestHand = playerHand
 		}
+	}
+
+	if winner == nil {
+		log.Println("Warning: No winner found in EvaluateHands")
 	}
 
 	return winner
@@ -193,13 +202,6 @@ func (h *Holdem) GetStage() int {
 
 func (h *Holdem) SetStage(stage int) {
 	h.stage = stage
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 type Hand struct {
@@ -364,7 +366,16 @@ func isPair(cards []models.Card) (bool, []int) {
 func isHighCard(cards []models.Card) (bool, []int) {
 	values := getValues(cards)
 	sort.Sort(sort.Reverse(sort.IntSlice(values)))
-	return true, values[:5]
+
+	returnCount := min(5, len(values))
+	return true, values[:returnCount]
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func filterBySuit(cards []models.Card, suit string) []models.Card {

@@ -28,8 +28,11 @@ type Game interface {
 	IsInProgress() bool
 	SetInProgress(bool)
 	IsRoundOver() bool
+    AddToPot(amount int)
 	GetChannel() string
 	ResetRound()
+	CalculateSidePots()
+	GetStage() int
 }
 
 type BaseGame struct {
@@ -42,6 +45,7 @@ type BaseGame struct {
 	Turn       int
 	InProgress bool
 	Channel    string
+	Stage      int
 }
 
 func (g *BaseGame) AddPlayer(player *models.Player) {
@@ -160,6 +164,15 @@ func (g *BaseGame) ResetRound() {
 	g.CurrentBet = 0
 	g.River = make([]models.Card, 0)
 	g.Deck = GenerateDeck()
+}
+
+
+func (g *BaseGame) AddToPot(amount int) {
+	g.Pot += amount
+}
+
+func (g *BaseGame) GetStage() int {
+	return g.Stage
 }
 
 func GenerateDeck() []models.Card {
